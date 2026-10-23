@@ -82,9 +82,22 @@ describe("leaderboardPage", () => {
     expect(html).toContain("<h1>Hacktoberfest 2026 leaderboard</h1>");
     expect(html.indexOf(">ada<")).toBeLessThan(html.indexOf(">bob<"));
     expect(html).toContain('<a href="https://github.com/ada">ada</a>');
-    expect(html).toContain("6 merged PRs");
+    expect(html).toContain('<span class="count">6<span class="count-label"> merged PRs</span></span>');
     expect(html).toContain('<span class="chip top">In the top 5</span>');
     expect(html).toContain('<span class="chip progress">3 more to qualify</span>');
+  });
+
+  it("keeps the merged PR label in its own span and hides only it on phones", () => {
+    expect(html).toContain('<span class="count">6<span class="count-label"> merged PRs</span></span>');
+    const one = leaderboardPage({ ...board, rows: [row("ada", 1)] }, program, links, during);
+    expect(one).toContain('<span class="count">1<span class="count-label"> merged PR</span></span>');
+
+    const start = html.indexOf("@media (max-width:520px){.chip");
+    const phoneRule = html.slice(start, html.indexOf("\n", start));
+    expect(phoneRule).toContain(".chip,.count-label{display:none}");
+    expect(phoneRule).not.toContain(".count{display:none}");
+    expect(phoneRule).not.toContain(".cardlink{display:none}");
+    expect(html).toContain('<a class="cardlink" href="/leaderboard/2026-10/u/ada"');
   });
 
   it("states the rules, the window and who the reward comes from", () => {
@@ -160,7 +173,7 @@ describe("leaderboardPage", () => {
   it("shows the unlinked line at phone width", () => {
     const htmlWithNotice = leaderboardPage(board, program, links, during, { linking: true, members: new Map() });
     expect(htmlWithNotice).toContain('class="unlinked"');
-    expect(htmlWithNotice).toContain("@media (max-width:520px){.chip{display:none}}");
+    expect(htmlWithNotice).toContain("@media (max-width:520px){.chip,.count-label{display:none}");
     expect(htmlWithNotice).not.toContain(".unlinked{display:none}");
   });
 
