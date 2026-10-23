@@ -87,14 +87,21 @@ describe("leaderboardPage", () => {
     expect(html).toContain('<span class="chip progress">3 more to qualify</span>');
   });
 
-  it("keeps the merged PR label in its own span and hides only it on phones", () => {
+  it("keeps the merged PR label in its own span and uses compact, single-line phone styles", () => {
     expect(html).toContain('<span class="count">6<span class="count-label"> merged PRs</span></span>');
     const one = leaderboardPage({ ...board, rows: [row("ada", 1)] }, program, links, during);
     expect(one).toContain('<span class="count">1<span class="count-label"> merged PR</span></span>');
 
-    const start = html.indexOf("@media (max-width:520px){.chip");
-    const phoneRule = html.slice(start, html.indexOf("\n", start));
+    const style = html.slice(html.indexOf("<style>") + 7, html.indexOf("</style>"));
+    const start = style.indexOf("@media (max-width:520px){.board summary");
+    const phoneRule = style.slice(start, style.indexOf("\n", start));
+    expect(phoneRule).toContain(".board summary{gap:8px}");
+    expect(phoneRule).toContain(".rank{width:auto}");
+    expect(phoneRule).toContain(".board img{width:28px;height:28px}");
     expect(phoneRule).toContain(".chip,.count-label{display:none}");
+    expect(phoneRule).not.toContain(".who{");
+    expect(style).toContain(".who{flex:1;min-width:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}");
+    expect(style).not.toContain("overflow-wrap:anywhere");
     expect(phoneRule).not.toContain(".count{display:none}");
     expect(phoneRule).not.toContain(".cardlink{display:none}");
     expect(html).toContain('<a class="cardlink" href="/leaderboard/2026-10/u/ada"');
@@ -173,7 +180,7 @@ describe("leaderboardPage", () => {
   it("shows the unlinked line at phone width", () => {
     const htmlWithNotice = leaderboardPage(board, program, links, during, { linking: true, members: new Map() });
     expect(htmlWithNotice).toContain('class="unlinked"');
-    expect(htmlWithNotice).toContain("@media (max-width:520px){.chip,.count-label{display:none}");
+    expect(htmlWithNotice).toContain(".chip,.count-label{display:none}");
     expect(htmlWithNotice).not.toContain(".unlinked{display:none}");
   });
 

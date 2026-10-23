@@ -133,7 +133,7 @@ main.wide{max-width:920px}
 h2.small{font:600 13px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin:0 0 12px}
 @media (max-width:520px){.tiles{grid-template-columns:1fr}.cta a{flex:1 1 100%;text-align:center}}
 footer{color:var(--muted);font-size:13px}
-@media (max-width:520px){.chip,.count-label{display:none}.who{white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere}}
+@media (max-width:520px){.board summary{gap:8px}.rank{width:auto}.board img{width:28px;height:28px}.chip,.count-label{display:none}}
 `;
 
 export interface PageLinks {
