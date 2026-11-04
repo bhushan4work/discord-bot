@@ -296,13 +296,15 @@ describe("scheduled leaderboard", () => {
     // A program whose topN reaches below the 10 rows shown in the embed.
     env = makeEnv({ PROGRAMS: [{ ...OCTOBER, topN: 12 }], LINKING: "on", DISCORD_CLIENT_SECRET: "secret" });
     // Eleven contributors, each with the minimum 5 merged PRs, so all are winners.
+    // u11's PRs are dated later than everyone else's so it is the last to reach
+    // five qualifying PRs and ranks 11th — outside the 10 rows shown in the embed.
     const items = Array.from({ length: 11 }, (_, i) => ({
       html_url: `https://github.com/codercops/toolbelt/pull/${i + 1}`,
       number: i + 1,
       title: "Fix a thing",
       repository_url: "https://api.github.com/repos/codercops/toolbelt",
       user: { login: `u${i + 1}` },
-      pull_request: { merged_at: `2026-10-0${(i % 9) + 1}T00:00:00Z` },
+      pull_request: { merged_at: `2026-10-${i === 10 ? "10" : `0${(i % 9) + 1}`}T00:00:00Z` },
     }));
     // Five PRs per contributor (55 total) so each qualifies at minPrs=5.
     const allItems = Array.from({ length: 5 }, (_, batch) =>
@@ -318,9 +320,9 @@ describe("scheduled leaderboard", () => {
     await run("2026-11-01T04:30:00Z");
     const desc = fetched.discord()[0]?.body.embeds[0].description;
     // The linked winner ranked 11th is mentioned by Discord id in the congratulations line.
-    expect(desc).toContain("(<@99>)");
+    expect(desc).toContain("**u11** (<@99>)");
     // They are not told to run /link.
-    expect(desc).not.toContain("u11: run `/link`");
+    expect(desc).not.toContain("**u11**: run `/link`");
   });
 
   it("doesn't announce a program that ended long before it was added", async () => {
