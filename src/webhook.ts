@@ -1,9 +1,9 @@
 // Handles GitHub webhook events: releases, starter issues and merged PRs.
-import type { Config, Env } from "./config";
+import type { Config, Env, Program } from "./config";
 import { DiscordError, editMessage, sendMessage } from "./discord";
-import { countMergedPrs, getIssue, type GithubIssue, type StarterIssue } from "./github";
+import { countMergedPrs, getIssue, GithubError, type GithubIssue, type StarterIssue } from "./github";
 import { cacheLeaderboard, invalidateLeaderboard, recentMerges, rememberMerges, searchCountedPrs } from "./leaderboard";
-import { getLinkByGithub } from "./links";
+import { getLinkByGithub, getLinkByGithubId, saveLink } from "./links";
 import { linkingEnabled } from "./oauth";
 import { grantEarnedRoles } from "./roles";
 import { mergedPrMessage, releaseMessage, starterIssueMessage, type StarterState } from "./messages";
@@ -30,13 +30,15 @@ interface IssuesEvent {
 interface PullRequestEvent {
   action: string;
   repository: Repository;
+  /** The label that was added, on labeled events. */
+  label?: { name: string };
   pull_request: {
     number: number;
     title: string;
     html_url: string;
     merged: boolean;
     merged_at: string | null;
-    user: { login: string; type: string };
+    user: { login: string; type: string; id?: number | string };
     labels: { name: string }[];
   };
 }
@@ -60,7 +62,7 @@ export async function handleGithubEvent(event: string, payload: unknown, env: En
 }
 
 async function onRelease(e: ReleaseEvent, env: Env, cfg: Config): Promise<string> {
-  if (e.action !== "published" || e.release.draft || e.release.prerelease || !ours(cfg, e.repository)) {
+  if (e.action !== "released" || e.release.draft || e.release.prerelease || !ours(cfg, e.repository)) {
     return "ignored release";
   }
   await sendMessage(env, env.CHANNEL_RELEASES, releaseMessage(e.repository.name, e.release));
@@ -105,12 +107,30 @@ const resyncKey = (repo: string, number: number) => `resync:${repo}#${number}`;
 /** A channel takes about five messages per five seconds; the rest wait for the next run. */
 const RESYNC_PER_RUN = 5;
 
+// Serializes issue feed updates within this isolate so concurrent events don't create duplicate posts.
+const issueLocks = new Map<string, Promise<void>>();
+
+async function withIssueLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = issueLocks.get(key);
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  issueLocks.set(key, current);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (issueLocks.get(key) === current) issueLocks.delete(key);
+  }
+}
+
 /** Posts the issue's message, or edits the one already posted when it changed. */
 async function writeFeed(env: Env, record: FeedRecord | null, issue: StarterIssue, state: StarterState): Promise<string> {
   const message = starterIssueMessage(issue, state);
   const snapshot = starterIssueSnapshot(message);
   if (record?.message === snapshot) return "unchanged starter issue";
-  if (record) {
+  const prev = record;
+  if (record?.messageId) {
     try {
       await editMessage(env, env.CHANNEL_STARTER_ISSUES, record.messageId, message);
     } catch (err) {
@@ -121,55 +141,78 @@ async function writeFeed(env: Env, record: FeedRecord | null, issue: StarterIssu
       }
       record = null;
     }
+  } else if (record) {
+    return "unchanged starter issue";
   }
-  const messageId = record?.messageId ?? (await sendMessage(env, env.CHANNEL_STARTER_ISSUES, message));
-  await env.STATE.put(feedKey(issue.repo, issue.number), JSON.stringify({ messageId, state: state.kind, message: snapshot } satisfies FeedRecord));
+
+  const key = feedKey(issue.repo, issue.number);
+  let messageId = record?.messageId;
+  if (!messageId) {
+    const claim: FeedRecord = { messageId: "", state: state.kind, message: snapshot };
+    await env.STATE.put(key, JSON.stringify(claim), { expirationTtl: 60 });
+    try {
+      messageId = await sendMessage(env, env.CHANNEL_STARTER_ISSUES, message);
+    } catch (err) {
+      try {
+        if (prev) await env.STATE.put(key, JSON.stringify(prev));
+        else await env.STATE.delete(key);
+      } catch {}
+      throw err;
+    }
+  }
+
+  await env.STATE.put(key, JSON.stringify({ messageId, state: state.kind, message: snapshot } satisfies FeedRecord));
   return record ? `updated starter issue (${state.kind})` : "posted starter issue";
 }
 
 const rateLimited = (err: unknown) => err instanceof DiscordError && err.status === 429;
 const messageGone = (err: unknown) => err instanceof DiscordError && err.status === 404;
+const retryableGithub = (err: unknown) =>
+  !(err instanceof GithubError) || err.status >= 500 || err.status === 403 || err.status === 429;
 
 // Keeps one message per issue in #starter-issues and edits it as the issue is
 // claimed, released or closed, so the feed always shows what's really free.
 async function onIssue(e: IssuesEvent, env: Env, cfg: Config): Promise<string> {
   if (!ours(cfg, e.repository) || e.issue.pull_request) return "ignored issue";
-  const labels = (e.issue.labels ?? []).map((l) => l.name);
-  const issue: StarterIssue = {
-    repo: e.repository.name,
-    number: e.issue.number,
-    title: e.issue.title,
-    url: e.issue.html_url,
-    labels,
-  };
-  const record = await env.STATE.get<FeedRecord>(feedKey(issue.repo, issue.number), "json");
-  const state = starterState(e.issue, cfg, e.action);
+  const issueKey = feedKey(e.repository.name, e.issue.number);
+  return withIssueLock(issueKey, async () => {
+    const labels = (e.issue.labels ?? []).map((l) => l.name);
+    const issue: StarterIssue = {
+      repo: e.repository.name,
+      number: e.issue.number,
+      title: e.issue.title,
+      url: e.issue.html_url,
+      labels,
+    };
+    let record = await env.STATE.get<FeedRecord>(issueKey, "json");
+    const state = starterState(e.issue, cfg, e.action);
 
-  if (!record) {
-    // A new post needs a reason: a starter label was just added, or the issue
-    // became free again (unassigned, reopened or unblocked). "opened" is
-    // skipped on purpose, because GitHub also
-    // sends "labeled" for every label an issue is created with.
-    const starterLabelAdded =
-      e.action === "labeled" && cfg.starterLabels.includes((e.label?.name ?? "").toLowerCase());
-    const freedUp =
-      e.action === "unassigned" ||
-      e.action === "reopened" ||
-      (e.action === "unlabeled" && (e.label?.name ?? "").toLowerCase() === "blocked");
-    if (!starterLabelAdded && !freedUp) return "ignored issue";
-    // Only announce issues that are free to take right now.
-    if (state.kind !== "open" || !isStarterIssue(labels, cfg)) return "ignored issue";
-  }
+    if (!record) {
+      // A new post needs a reason: a starter label was just added, or the issue
+      // became free again (unassigned, reopened or unblocked). "opened" is
+      // skipped on purpose, because GitHub also
+      // sends "labeled" for every label an issue is created with.
+      const starterLabelAdded =
+        e.action === "labeled" && cfg.starterLabels.includes((e.label?.name ?? "").toLowerCase());
+      const freedUp =
+        e.action === "unassigned" ||
+        e.action === "reopened" ||
+        (e.action === "unlabeled" && (e.label?.name ?? "").toLowerCase() === "blocked");
+      if (!starterLabelAdded && !freedUp) return "ignored issue";
+      // Only announce issues that are free to take right now.
+      if (state.kind !== "open" || !isStarterIssue(labels, cfg)) return "ignored issue";
+    }
 
-  try {
-    return await writeFeed(env, record, issue, state);
-  } catch (err) {
-    // GitHub doesn't send a failed delivery again, so leave the update to the
-    // cron, which reads the issue from GitHub (see resyncStarterIssues).
-    if (!rateLimited(err)) throw err;
-    await env.STATE.put(resyncKey(issue.repo, issue.number), "1");
-    return "starter issue rate limited, resync queued";
-  }
+    try {
+      return await writeFeed(env, record, issue, state);
+    } catch (err) {
+      // GitHub doesn't send a failed delivery again, so leave the update to the
+      // cron, which reads the issue from GitHub (see resyncStarterIssues).
+      if (!rateLimited(err)) throw err;
+      await env.STATE.put(resyncKey(issue.repo, issue.number), "1");
+      return "starter issue rate limited, resync queued";
+    }
+  });
 }
 
 /** Brings the feed messages that Discord rate limited in line with their issues on GitHub. */
@@ -181,13 +224,46 @@ export async function resyncStarterIssues(env: Env, cfg: Config): Promise<void> 
     await env.STATE.delete(name);
     if (!repo || !number) continue;
     try {
-      const current = await getIssue(env, cfg, repo, Number(number));
-      const issue: StarterIssue = { repo, number: current.number, title: current.title, url: current.html_url, labels: current.labels.map((l) => l.name) };
-      const record = await env.STATE.get<FeedRecord>(feedKey(repo, current.number), "json");
-      const state = starterState(current, cfg);
-      // Like onIssue, only post issues that are free to take right now.
-      if (!record && state.kind !== "open") continue;
-      await writeFeed(env, record, issue, state);
+      const num = Number(number);
+      const issueKey = feedKey(repo, num);
+      await withIssueLock(issueKey, async () => {
+        const record = await env.STATE.get<FeedRecord>(issueKey, "json");
+        let issue: StarterIssue;
+        let state: StarterState;
+        try {
+          const current = await getIssue(env, cfg, repo, num);
+          issue = { repo, number: current.number, title: current.title, url: current.html_url, labels: current.labels.map((l) => l.name) };
+          state = starterState(current, cfg);
+        } catch (err) {
+          if (err instanceof GithubError && err.status === 404) {
+            if (!record) return;
+            state = { kind: "unavailable" };
+            let title = "";
+            let url = `https://github.com/${cfg.org}/${repo}/issues/${number}`;
+            let labels: string[] = [];
+            if (record.message) {
+              try {
+                const snap = JSON.parse(record.message);
+                if (typeof snap.url === "string") url = snap.url;
+                if (typeof snap.title === "string") {
+                  const prefix = `${repo} #${number}: `;
+                  title = snap.title.startsWith(prefix) ? snap.title.slice(prefix.length) : snap.title;
+                }
+                if (typeof snap.description === "string" && snap.description.includes("\n")) {
+                  labels = snap.description.split("\n")[0].split(", ").map((l: string) => l.trim()).filter(Boolean);
+                }
+              } catch {}
+            }
+            issue = { repo, number: num, title, url, labels };
+          } else {
+            if (retryableGithub(err)) await env.STATE.put(name, "1");
+            throw err;
+          }
+        }
+        // Like onIssue, only post issues that are free to take right now.
+        if (!record && state.kind !== "open") return;
+        await writeFeed(env, record, issue, state);
+      });
     } catch (err) {
       if (rateLimited(err)) {
         // The channel is still limited, so the rest wait as well.
@@ -199,12 +275,78 @@ export async function resyncStarterIssues(env: Env, cfg: Config): Promise<void> 
   }
 }
 
+/** The shoutout a merged PR got, so a late label can edit it instead of posting again. */
+interface ShoutoutRecord {
+  messageId: string;
+  /** True when the shoutout already carries a count line. */
+  counted: boolean;
+  discordId?: string;
+  linking?: boolean;
+  newRoles?: string[];
+}
+
+const shoutoutKey = (repo: string, number: number) => `merged-pr:${repo}#${number}`;
+/** A late label usually lands soon after the merge, so a few days is plenty. */
+const SHOUTOUT_TTL_SECONDS = 3 * 24 * 60 * 60;
+
+/**
+ * Counts a PR for a program and caches the board, the way a merge does.
+ * Returns undefined when the count couldn't be worked out; the cached board
+ * is cleared then, so a stale one is never served.
+ */
+async function countForProgram(
+  env: Env,
+  cfg: Config,
+  program: Program,
+  e: PullRequestEvent,
+  mergedAt: Date
+): Promise<Parameters<typeof mergedPrMessage>[1] | undefined> {
+  const pr = e.pull_request;
+  try {
+    // GitHub's search index can lag a few seconds behind the merge, so add
+    // this event's PR, and the ones merged just before it that search doesn't
+    // have yet either, before counting and caching the leaderboard.
+    const login = pr.user.login.toLowerCase();
+    const searched = await searchCountedPrs(env, cfg, program);
+    const indexed = new Set(searched.map((p) => p.url));
+    const pending = [
+      ...(await recentMerges(env, program)),
+      {
+        login: pr.user.login,
+        mergedAt: mergedAt.toISOString(),
+        url: pr.html_url,
+        title: pr.title,
+        repo: e.repository.name,
+        number: pr.number,
+      },
+    ].filter((p, i, all) => !indexed.has(p.url) && all.findIndex((q) => q.url === p.url) === i);
+    await rememberMerges(env, program, pending);
+    const prs = [...searched, ...pending];
+    await cacheLeaderboard(env, cfg, program, prs);
+    const others = prs.filter(
+      (p) => p.login.toLowerCase() === login && p.url !== pr.html_url && Date.parse(p.mergedAt) <= mergedAt.getTime()
+    );
+    const count = others.length + 1;
+    return {
+      count,
+      label: program.title,
+      // Said once, on the merge that takes them to the minimum.
+      qualified: count === program.minPrs ? { topN: program.topN, reward: program.reward, note: program.note } : undefined,
+    };
+  } catch {
+    // The shoutout matters more than the count; don't serve an old board.
+    await invalidateLeaderboard(env, program);
+    return undefined;
+  }
+}
+
 async function onPullRequest(e: PullRequestEvent, env: Env, cfg: Config): Promise<string> {
   const pr = e.pull_request;
-  if (e.action !== "closed" || !pr.merged || !ours(cfg, e.repository)) return "ignored pull request";
+  if (!ours(cfg, e.repository)) return "ignored pull request";
   if (pr.user.type === "Bot" || cfg.excludedUsers.has(pr.user.login.toLowerCase())) return "ignored pull request author";
+  if (e.action === "labeled") return onLateLabel(e, env, cfg);
+  if (e.action !== "closed" || !pr.merged) return "ignored pull request";
 
-  let countInWindow: Parameters<typeof mergedPrMessage>[1];
   const mergedAt = pr.merged_at ? new Date(pr.merged_at) : new Date();
   // The program this PR counts for, if any.
   const program = cfg.programs.find(
@@ -214,47 +356,23 @@ async function onPullRequest(e: PullRequestEvent, env: Env, cfg: Config): Promis
       mergedAt >= p.start &&
       mergedAt <= p.end
   );
-  if (program) {
-    try {
-      // GitHub's search index can lag a few seconds behind the merge, so add
-      // this event's PR, and the ones merged just before it that search doesn't
-      // have yet either, before counting and caching the leaderboard.
-      const login = pr.user.login.toLowerCase();
-      const searched = await searchCountedPrs(env, cfg, program);
-      const indexed = new Set(searched.map((p) => p.url));
-      const pending = [
-        ...(await recentMerges(env, program)),
-        {
-          login: pr.user.login,
-          mergedAt: mergedAt.toISOString(),
-          url: pr.html_url,
-          title: pr.title,
-          repo: e.repository.name,
-          number: pr.number,
-        },
-      ].filter((p, i, all) => !indexed.has(p.url) && all.findIndex((q) => q.url === p.url) === i);
-      await rememberMerges(env, program, pending);
-      const prs = [...searched, ...pending];
-      await cacheLeaderboard(env, cfg, program, prs);
-      const others = prs.filter(
-        (p) => p.login.toLowerCase() === login && p.url !== pr.html_url && Date.parse(p.mergedAt) <= mergedAt.getTime()
-      );
-      const count = others.length + 1;
-      countInWindow = {
-        count,
-        label: program.title,
-        // Said once, on the merge that takes them to the minimum.
-        qualified: count === program.minPrs ? { topN: program.topN, reward: program.reward, note: program.note } : undefined,
-      };
-    } catch {
-      // The shoutout matters more than the count; don't serve an old board.
-      await invalidateLeaderboard(env, program);
-    }
-  }
+  const countInWindow = program ? await countForProgram(env, cfg, program, e, mergedAt) : undefined;
 
   // If the author linked their GitHub account, show who they are here and
   // hand out any role this merge earned. The shoutout goes out either way.
-  const link = await getLinkByGithub(env, pr.user.login);
+  let link = pr.user.id !== undefined ? await getLinkByGithubId(env, String(pr.user.id)) : null;
+  if (!link) {
+    const byLogin = await getLinkByGithub(env, pr.user.login);
+    if (byLogin && (pr.user.id === undefined || byLogin.githubId === String(pr.user.id))) {
+      link = byLogin;
+      if (pr.user.id !== undefined) {
+        await saveLink(env, link);
+      }
+    }
+  } else if (link.githubLogin !== pr.user.login) {
+    link = { ...link, githubLogin: pr.user.login };
+    await saveLink(env, link);
+  }
   let newRoles: string[] = [];
   if (link) {
     try {
@@ -265,7 +383,7 @@ async function onPullRequest(e: PullRequestEvent, env: Env, cfg: Config): Promis
     }
   }
 
-  await sendMessage(
+  const messageId = await sendMessage(
     env,
     env.CHANNEL_MERGED_PRS,
     mergedPrMessage(
@@ -282,5 +400,72 @@ async function onPullRequest(e: PullRequestEvent, env: Env, cfg: Config): Promis
       countInWindow
     )
   );
+  // Kept so a program label added after the merge can edit this shoutout
+  // instead of posting a second one. It expires on its own.
+  await env.STATE.put(
+    shoutoutKey(e.repository.name, pr.number),
+    JSON.stringify({
+      messageId,
+      counted: countInWindow !== undefined,
+      discordId: link?.discordId,
+      linking: linkingEnabled(env),
+      newRoles,
+    } satisfies ShoutoutRecord),
+    { expirationTtl: SHOUTOUT_TTL_SECONDS }
+  );
   return "posted merged pull request";
+}
+
+/**
+ * A program label added after the merge, e.g. by the accepted-label workflow
+ * when a maintainer missed it. The PR already has its shoutout, so this edits
+ * that message to the text it would have had at the merge, and refreshes the
+ * board. A PR whose shoutout already has the count, or a label that isn't a
+ * program's, changes nothing.
+ */
+async function onLateLabel(e: PullRequestEvent, env: Env, cfg: Config): Promise<string> {
+  const pr = e.pull_request;
+  if (!pr.merged || !pr.merged_at) return "ignored pull request";
+  const added = e.label?.name;
+  if (!added) return "ignored pull request";
+  const mergedAt = new Date(pr.merged_at);
+  const program = cfg.programs.find(
+    (p) => p.repos.includes(e.repository.name) && p.label === added && mergedAt >= p.start && mergedAt <= p.end
+  );
+  if (!program) return "ignored pull request";
+
+  const record = await env.STATE.get<ShoutoutRecord>(shoutoutKey(e.repository.name, pr.number), "json");
+  if (record?.counted) return "ignored pull request";
+
+  const countInWindow = await countForProgram(env, cfg, program, e, mergedAt);
+  if (!countInWindow) return "late label, shoutout unchanged";
+  // No stored shoutout (it predates this, or its record expired): the board
+  // is refreshed, but there's no message to edit, and guessing at one would
+  // risk editing the wrong message.
+  if (!record) return "late label, board refreshed";
+
+  await editMessage(
+    env,
+    env.CHANNEL_MERGED_PRS,
+    record.messageId,
+    mergedPrMessage(
+      {
+        repo: e.repository.name,
+        number: pr.number,
+        title: pr.title,
+        url: pr.html_url,
+        login: pr.user.login,
+        discordId: record.discordId,
+        linking: record.linking,
+        newRoles: record.newRoles,
+      },
+      countInWindow
+    )
+  );
+  await env.STATE.put(
+    shoutoutKey(e.repository.name, pr.number),
+    JSON.stringify({ ...record, counted: true } satisfies ShoutoutRecord),
+    { expirationTtl: SHOUTOUT_TTL_SECONDS }
+  );
+  return "updated merged pull request shoutout";
 }

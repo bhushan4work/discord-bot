@@ -10,6 +10,7 @@ import {
   starterIssuesReply,
   truncate,
   truncateReleaseNotes,
+  unlinkReply,
 } from "../src/messages";
 import { makeEnv, OCTOBER } from "./helpers";
 
@@ -90,7 +91,7 @@ describe("starterIssueMessage", () => {
   const issue = { repo: "toolbelt", number: 124, title: "Quote YAML strings", url: "https://github.com/codercops/toolbelt/issues/124", labels: ["bug", "good first issue"] };
 
   it("describes each state", () => {
-    expect(starterIssueMessage(issue, { kind: "open" }).embeds?.[0]?.description).toContain("Comment on the issue to claim it");
+    expect(starterIssueMessage(issue, { kind: "open" }).embeds?.[0]?.description).toContain("Comment to ask to be assigned");
     expect(starterIssueMessage(issue, { kind: "claimed", by: "ada_l" }).embeds?.[0]?.description).toContain("Claimed by ada\\_l.");
     expect(starterIssueMessage(issue, { kind: "done" }).embeds?.[0]?.description).toContain("Done.");
   });
@@ -225,6 +226,15 @@ describe("leaderboardMessage", () => {
     expect(embed?.description).not.toContain("more to qualify");
   });
 
+  it("says 'qualified' for qualifiers who didn't win once the program is over", () => {
+    const qualifiers = { ...board, rows: [row("ada", 6, true, true), row("bob", 5, true)] };
+    const final = leaderboardMessage(qualifiers, program, { final: true }).embeds?.[0]?.description;
+    expect(final).toContain("2. **bob** · 5 merged PRs · qualified");
+    // While it runs, they are still in the running.
+    const running = leaderboardMessage(qualifiers, program).embeds?.[0]?.description;
+    expect(running).toContain("2. **bob** · 5 merged PRs · qualifies");
+  });
+
   it("asks winners who haven't linked to run /link, since the form goes out by DM", () => {
     const winners = { ...board, rows: [row("ada", 6, true, true), row("Bob", 5, true, true), row("cy", 5, true, true)] };
     const text = (members: Map<string, string>) =>
@@ -265,10 +275,18 @@ describe("leaderboardMessage", () => {
   });
 
   it("handles a final result with no qualifiers and an empty board", () => {
-    const none = leaderboardMessage({ ...board, rows: [row("bob", 2)] }, program, { final: true }).embeds?.[0];
-    expect(none?.description).toContain("Nobody reached 5 merged PRs");
+    const empty = leaderboardMessage({ ...board, rows: [] }, program, { final: true }).embeds?.[0];
+    expect(empty?.description).toContain("No merged pull requests were counted.");
+    expect(empty?.description).not.toContain("be the first");
+    // closing note should be added
+    const withNote = leaderboardMessage({ ...board, rows: [] }, program, { final: true, finalNote: "Add it to your profile." }).embeds?.[0];
+    expect(withNote?.description).toContain("Add it to your profile.");
+  });
+
+  it("handles a running empty board", () => {
     const empty = leaderboardMessage({ ...board, rows: [] }, program).embeds?.[0];
     expect(empty?.description).toContain("No merged PRs counted yet");
+    expect(empty?.description).toContain("be the first");
   });
 });
 
@@ -277,6 +295,7 @@ describe("starterIssuesReply", () => {
 
   it("shows one embed per repo with a link to the full filtered list", () => {
     const reply = starterIssuesReply(cfg, [{ repo: "toolbelt", issues: [issue(2), issue(1)] }, { repo: "ogcops", issues: [] }]);
+    expect(reply.content).toContain("Comment on an issue on GitHub to ask to be assigned");
     expect(reply.embeds).toHaveLength(2);
     expect(reply.embeds?.[0]?.title).toBe("toolbelt: 2 open starter issues");
     expect(reply.embeds?.[0]?.description).toContain("[#2](https://github.com/codercops/toolbelt/issues/2) Issue 2");
@@ -303,5 +322,26 @@ describe("starterIssuesReply", () => {
     const embed = starterIssuesReply(cfg, [{ repo: "toolbelt", issues }]).embeds?.[0];
     expect(embed?.title).toBe("toolbelt: 30 open starter issues");
     expect(embed?.description).toContain("and 18 more");
+  });
+});
+
+describe("unlinkReply", () => {
+  it("confirms roles were taken back when removal succeeded", () => {
+    const reply = unlinkReply("Ada", true);
+    expect(reply.content).toBe(
+      "Unlinked from **Ada**. I deleted what I had stored and took back the contributor roles. Run `/link` if you change your mind."
+    );
+  });
+
+  it("notes that roles couldn't be removed and a moderator can take them off when removal failed", () => {
+    const reply = unlinkReply("Ada", false);
+    expect(reply.content).toBe(
+      "Unlinked from **Ada**. I deleted what I had stored, but the roles couldn't be removed and a moderator can take them off. Run `/link` if you change your mind."
+    );
+  });
+
+  it("escapes markdown in logins", () => {
+    const reply = unlinkReply("ada_lovelace", true);
+    expect(reply.content).toContain("**ada\\_lovelace**");
   });
 });

@@ -61,7 +61,7 @@ export function starterIssueMessage(issue: StarterIssue, state: StarterState): M
   const labels = issue.labels.join(", ");
   const status =
     state.kind === "open"
-      ? "Open. Comment on the issue to claim it (one issue at a time)."
+      ? "Open. Comment to ask to be assigned; the post updates once you're assigned (one issue at a time)."
       : state.kind === "claimed"
         ? `Claimed by ${escapeMarkdown(state.by)}.`
         : state.kind === "done"
@@ -70,7 +70,7 @@ export function starterIssueMessage(issue: StarterIssue, state: StarterState): M
   return {
     embeds: [
       {
-        title: truncate(`${issue.repo} #${issue.number}: ${issue.title}`, 256),
+        title: truncate(issue.title ? `${issue.repo} #${issue.number}: ${issue.title}` : `${issue.repo} #${issue.number}`, 256),
         url: issue.url,
         description: labels ? `${labels}\n${status}` : status,
         color: COLOR[state.kind],
@@ -156,14 +156,21 @@ export function leaderboardMessage(
     const prs = `${row.count} merged ${row.count === 1 ? "PR" : "PRs"}`;
     // Same as the chips on the page: a countdown while it runs, nothing once it's over.
     const countdown = opts.final ? "" : ` · ${minPrs - row.count} more to qualify`;
-    const note = row.winner ? (opts.final ? " · winner" : " · in the top " + topN) : row.qualifies ? " · qualifies" : countdown;
+    const note = row.winner
+      ? opts.final ? " · winner" : " · in the top " + topN
+      : row.qualifies ? (opts.final ? " · qualified" : " · qualifies") : countdown;
     return `${i + 1}. ${who(row.login)} · ${prs}${note}`;
   });
   const winners = board.rows.filter((r) => r.winner);
 
   let description: string;
   if (lines.length === 0) {
-    description = "No merged PRs counted yet. Pick a starter issue and be the first.";
+    if (opts.final) {
+      description = "No merged pull requests were counted.";
+      if (opts.finalNote) description += `\n\n${opts.finalNote}`;
+    } else {
+      description = "No merged PRs counted yet. Pick a starter issue and be the first.";
+    }
   } else {
     description = lines.join("\n");
     if (opts.final) {
@@ -216,7 +223,7 @@ export function starterIssuesReply(
     };
   });
   return {
-    content: "Comment on an issue on GitHub to claim it. One issue at a time, please.",
+    content: "Comment on an issue on GitHub to ask to be assigned. One issue at a time, please.",
     embeds,
   };
 }
@@ -348,6 +355,16 @@ export function linkPrompt(url: string, currentLogin?: string): MessagePayload {
     "No GitHub on your Discord profile yet? Add it first under User Settings > Connections. The button works for 15 minutes.",
   ];
   return { content: lines.join("\n"), components: [row(linkButton("Link my GitHub", url))] };
+}
+
+/** The private reply to /unlink. */
+export function unlinkReply(login: string, rolesRemoved: boolean): MessagePayload {
+  const note = rolesRemoved
+    ? " and took back the contributor roles."
+    : ", but the roles couldn't be removed and a moderator can take them off.";
+  return {
+    content: `Unlinked from **${escapeMarkdown(login)}**. I deleted what I had stored${note} Run \`/link\` if you change your mind.`,
+  };
 }
 
 // ---- /help ----
